@@ -32,6 +32,20 @@ impl SessionStore {
     /// created lazily on first successful session save.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
+        // Multi-AI Code 定制：CLAW_DATA_DIR 把会话挪出工作目录。
+        //
+        // 默认布局是 <cwd>/.claw/sessions/<指纹>/，也就是在**用户的仓库里**留目录。
+        // 宿主应用把每个项目的 cwd 指向用户自己的仓库，默认行为等于往人家仓库拉东西。
+        //
+        // 改在 from_cwd 内部而不是给 8 个调用点逐个穿参数，是为了把 fork 补丁压到最小——
+        // 上游同步时要 rebase 的面积越小越好。from_data_dir 仍按 workspace_root 算指纹，
+        // 所以不同仓库的会话依旧互相隔离，只是不再落在仓库内部。
+        if let Some(dir) = std::env::var_os("CLAW_DATA_DIR") {
+            let dir = PathBuf::from(dir);
+            if !dir.as_os_str().is_empty() {
+                return Self::from_data_dir(dir, cwd);
+            }
+        }
         // #151: canonicalize so equivalent paths (symlinks, relative vs
         // absolute, /tmp vs /private/tmp on macOS) produce the same
         // workspace_fingerprint. Falls back to the raw path if canonicalize
