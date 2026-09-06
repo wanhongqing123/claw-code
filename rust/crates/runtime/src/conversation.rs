@@ -353,6 +353,19 @@ where
 
         loop {
             iterations += 1;
+            // Multi-AI Code 定制：在两轮之间响应中断。
+            //
+            // 这个信号原本只被 hooks.rs 消费（中止钩子子进程），代理循环本身从不检查它，
+            // 所以 Ctrl+C 停不下一个跑飞的多轮任务——只能等 max_iterations 撞上限。
+            //
+            // 检查放在循环顶部而不是流式读取内部：那样只需要在两次模型调用之间生效，
+            // 不必给 HTTP 流加取消，改动面小得多。代价是**不会打断正在进行的那一次响应**，
+            // 会等当前这轮读完再停。对「任务跑飞了要叫停」这个真实需求，这一档就够。
+            if self.hook_abort_signal.is_aborted() {
+                let error = RuntimeError::new("conversation interrupted");
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
                     "conversation loop exceeded the maximum number of iterations",

@@ -7742,6 +7742,9 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
+        // Multi-AI Code 定制：把本轮的中断信号交给桥，IM 侧的 interrupt 才有东西可置位。
+        // 信号是 Arc<AtomicBool>，跨线程共享安全。
+        multi_ai_code_im_bridge::set_turn_signal(Some(hook_abort_signal.clone()));
         let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
@@ -7766,10 +7769,22 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Drop 时清空——run_turn 有多个 return 分支（自动压缩重试那几条），
+        // 用守卫比在每个出口手动清可靠。
+        struct TurnSignalGuard;
+        impl Drop for TurnSignalGuard {
+            fn drop(&mut self) {
+                multi_ai_code_im_bridge::set_turn_signal(None);
+            }
+        }
+
         // Multi-AI Code 定制：一轮开始/结束/失败各推一条结构化事件给宿主。
         // 三处调用都是 fire-and-forget，桥没装或宿主不在时是空操作。
         multi_ai_code_im_bridge::emit("task_started", input);
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        // 本轮结束后必须清掉注册的信号：否则两轮之间收到的 interrupt 会置位一个
+        // 已经用完的信号，看起来「中断成功」但什么都没停，下一轮反而可能被它误伤。
+        let _turn_signal_guard = TurnSignalGuard;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(

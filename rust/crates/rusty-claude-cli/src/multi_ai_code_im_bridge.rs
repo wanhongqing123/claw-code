@@ -1,23 +1,30 @@
-//! Multi-AI Code 定制：把一轮对话的结构化事件推给宿主 Electron 应用。
+//! Multi-AI Code 定制：与宿主 Electron 应用之间的结构化事件通道。
 //!
 //! 宿主在启动 claw 前开一个只监听 127.0.0.1 的 TCP 端口，并通过
 //! `--multi-ai-code-im-ipc tcp://127.0.0.1:<port>?token=<token>` 把地址交给我们。
 //! 之后双方用「一行一个 JSON」通信，每条都带 token。
 //!
 //! 出站（claw → 宿主）：
+//!   {"token":"..","kind":"control_ready"}                        连上就发，见下
 //!   {"token":"..","kind":"task_started","text":"<用户输入>","messageId":".."}
 //!   {"token":"..","kind":"assistant_final","text":"<助手正文>","messageId":".."}
 //!   {"token":"..","kind":"turn_error","text":"<错误信息>","messageId":".."}
+//!   {"token":"..","kind":"control_result","requestId":"..","ok":true,"text":".."}
 //!
 //! 入站（宿主 → claw）：
 //!   {"token":"..","kind":"ack","messageId":".."}
+//!   {"token":"..","kind":"control","requestId":"..","command":"interrupt"}
+//!
+//! **`control_ready` 不能省**：宿主只把控制命令推给已经声明过 control_ready 的连接
+//! （见宿主侧 writeControlPayload 只遍历 controlSockets）。不发就永远收不到控制命令，
+//! 而且不会有任何报错——只是静默地什么都不发生。
 //!
 //! **为什么要 ack**：这条数据连接曾经出现过「半死」——socket 仍然可写、write 返回成功，
 //! 但对端再也收不到，于是回传永久静默丢失、必须重启 AICLI 才恢复。所以每条带
 //! messageId 的事件都要等回执；超时或写失败就重连并补发未确认的那几条。
 //! 这与 codex/opencode 侧的做法一致，不要简化掉。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,8 +36,8 @@ use std::time::{Duration, Instant};
 const MAX_PENDING: usize = 8;
 /// 等 ack 的时限；超过即认为连接半死。
 const ACK_TIMEOUT: Duration = Duration::from_millis(1_500);
-/// 重连退避。
-const RECONNECT_BACKOFF: Duration = Duration::from_millis(300);
+/// 轮询 ack 集合的间隔。
+const ACK_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone)]
 pub struct BridgeEndpoint {
@@ -98,7 +105,7 @@ fn percent_decode(value: &str) -> String {
 }
 
 /// JSON 字符串转义。手写是为了不给这个 crate 增加序列化依赖——
-/// 我们只发三个固定形状的对象，字段全部是字符串。
+/// 我们只发几个固定形状的对象，字段全部是字符串。
 fn escape_json(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 8);
     for ch in value.chars() {
@@ -115,39 +122,107 @@ fn escape_json(value: &str) -> String {
     out
 }
 
+/// 从一行 JSON 里取某个字符串字段。只够解析我们自己定义的固定形状，
+/// 不是通用 JSON 解析器——刻意不引依赖。
+fn field(line: &str, name: &str) -> Option<String> {
+    let key = format!("\"{name}\":\"");
+    let start = line.find(&key)? + key.len();
+    let rest = &line[start..];
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 struct PendingEvent {
     message_id: String,
     line: String,
 }
 
-struct BridgeInner {
+struct Shared {
     endpoint: BridgeEndpoint,
     stream: Option<TcpStream>,
     pending: VecDeque<PendingEvent>,
+    acked: HashSet<String>,
+    /// 当前这一轮的中断信号。每轮开始注册、结束清空。
+    turn_signal: Option<runtime::HookAbortSignal>,
 }
 
-/// 事件推送器。**所有失败都吞掉**：宿主没起、连接断了、对端不回执，
+/// 事件通道。**所有失败都吞掉**：宿主没起、连接断了、对端不回执，
 /// 都不能影响 claw 本身的交互——它首先是一个能独立使用的 CLI。
 pub struct ImBridge {
-    inner: Arc<Mutex<BridgeInner>>,
+    shared: Arc<Mutex<Shared>>,
     counter: AtomicU64,
 }
 
 impl ImBridge {
     pub fn connect(endpoint: BridgeEndpoint) -> Self {
         let stream = TcpStream::connect(&endpoint.addr).ok().inspect(|stream| {
-            let _ = stream.set_read_timeout(Some(ACK_TIMEOUT));
             let _ = stream.set_nodelay(true);
         });
-        Self {
-            inner: Arc::new(Mutex::new(BridgeInner {
-                endpoint,
-                stream,
-                pending: VecDeque::new(),
-            })),
+        let shared = Arc::new(Mutex::new(Shared {
+            endpoint,
+            stream,
+            pending: VecDeque::new(),
+            acked: HashSet::new(),
+            turn_signal: None,
+        }));
+        let bridge = Self {
+            shared: Arc::clone(&shared),
             counter: AtomicU64::new(0),
+        };
+        bridge.announce_and_spawn_reader();
+        bridge
+    }
+
+    /// 发 control_ready 并起读线程。重连后要再走一遍。
+    fn announce_and_spawn_reader(&self) {
+        let Ok(mut shared) = self.shared.lock() else {
+            return;
+        };
+        let Some(stream) = shared.stream.as_ref() else {
+            return;
+        };
+        let Ok(mut write_half) = stream.try_clone() else {
+            return;
+        };
+        let Ok(read_half) = stream.try_clone() else {
+            return;
+        };
+        let ready = format!(
+            "{{\"token\":\"{}\",\"kind\":\"control_ready\"}}\n",
+            escape_json(&shared.endpoint.token)
+        );
+        if write_half.write_all(ready.as_bytes()).is_err() {
+            shared.stream = None;
+            return;
         }
+        let _ = write_half.flush();
+        drop(shared);
+
+        let shared = Arc::clone(&self.shared);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(read_half);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => handle_inbound(&shared, &line),
+                }
+            }
+        });
     }
 
     fn next_message_id(&self) -> String {
@@ -158,99 +233,188 @@ impl ImBridge {
     /// 推一条事件并等待回执；没等到就重连补发。全部失败也只是静默返回。
     pub fn emit(&self, kind: &str, text: &str) {
         let message_id = self.next_message_id();
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
-        };
-        let line = format!(
-            "{{\"token\":\"{}\",\"kind\":\"{}\",\"text\":\"{}\",\"messageId\":\"{}\"}}\n",
-            escape_json(&inner.endpoint.token),
-            escape_json(kind),
-            escape_json(text),
-            escape_json(&message_id)
-        );
-        inner.pending.push_back(PendingEvent {
-            message_id: message_id.clone(),
-            line,
-        });
-        while inner.pending.len() > MAX_PENDING {
-            inner.pending.pop_front();
-        }
-        Self::flush(&mut inner);
-    }
-
-    fn flush(inner: &mut BridgeInner) {
-        for _ in 0..2 {
-            if inner.stream.is_none() {
-                std::thread::sleep(RECONNECT_BACKOFF);
-                inner.stream = TcpStream::connect(&inner.endpoint.addr).ok().inspect(|s| {
-                    let _ = s.set_read_timeout(Some(ACK_TIMEOUT));
-                    let _ = s.set_nodelay(true);
-                });
-            }
-            let Some(stream) = inner.stream.as_ref() else {
+        let line = {
+            let Ok(shared) = self.shared.lock() else {
                 return;
             };
-            let Ok(mut write_half) = stream.try_clone() else {
-                inner.stream = None;
-                continue;
-            };
-
-            let mut wrote_all = true;
-            for event in inner.pending.iter() {
-                if write_half.write_all(event.line.as_bytes()).is_err() {
-                    wrote_all = false;
-                    break;
-                }
+            format!(
+                "{{\"token\":\"{}\",\"kind\":\"{}\",\"text\":\"{}\",\"messageId\":\"{}\"}}\n",
+                escape_json(&shared.endpoint.token),
+                escape_json(kind),
+                escape_json(text),
+                escape_json(&message_id)
+            )
+        };
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.pending.push_back(PendingEvent {
+                message_id,
+                line,
+            });
+            while shared.pending.len() > MAX_PENDING {
+                shared.pending.pop_front();
             }
-            if !wrote_all || write_half.flush().is_err() {
-                inner.stream = None;
-                continue;
-            }
-
-            // 等回执。write 成功不代表对端收到——半死 socket 正是这样丢数据的。
-            if Self::drain_acks(inner) {
-                return;
-            }
-            inner.stream = None;
         }
+        self.flush();
     }
 
-    /// 读 ack 并清掉已确认的事件。全部确认返回 true。
-    fn drain_acks(inner: &mut BridgeInner) -> bool {
-        let Some(stream) = inner.stream.as_ref() else {
-            return false;
-        };
-        let Ok(read_half) = stream.try_clone() else {
-            return false;
-        };
-        let mut reader = BufReader::new(read_half);
-        let deadline = Instant::now() + ACK_TIMEOUT;
-        while !inner.pending.is_empty() && Instant::now() < deadline {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => return false,
-                Ok(_) => {
-                    if let Some(id) = extract_ack_message_id(&line) {
-                        inner.pending.retain(|event| event.message_id != id);
+    fn flush(&self) {
+        for attempt in 0..2 {
+            {
+                let Ok(mut shared) = self.shared.lock() else {
+                    return;
+                };
+                if shared.stream.is_none() {
+                    let addr = shared.endpoint.addr.clone();
+                    shared.stream = TcpStream::connect(&addr).ok().inspect(|s| {
+                        let _ = s.set_nodelay(true);
+                    });
+                    if shared.stream.is_some() {
+                        drop(shared);
+                        // 重连后必须重新声明 control_ready，否则宿主不会再给这条连接
+                        // 推控制命令——它按连接维护 controlSockets。
+                        self.announce_and_spawn_reader();
                     }
                 }
-                Err(_) => return false,
+            }
+            let wrote = {
+                let Ok(mut shared) = self.shared.lock() else {
+                    return;
+                };
+                match shared.stream.as_ref().and_then(|s| s.try_clone().ok()) {
+                    None => {
+                        shared.stream = None;
+                        false
+                    }
+                    Some(mut write_half) => {
+                        let mut ok = true;
+                        for event in shared.pending.iter() {
+                            if write_half.write_all(event.line.as_bytes()).is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        ok && write_half.flush().is_ok()
+                    }
+                }
+            };
+            if !wrote {
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.stream = None;
+                }
+                continue;
+            }
+            // write 成功不代表对端收到——半死 socket 正是这样丢数据的。
+            if self.wait_for_acks() {
+                return;
+            }
+            if attempt == 0 {
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.stream = None;
+                }
             }
         }
-        inner.pending.is_empty()
+    }
+
+    /// 等读线程把 ack 填进来。全部确认返回 true。
+    fn wait_for_acks(&self) -> bool {
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        loop {
+            {
+                let Ok(mut shared) = self.shared.lock() else {
+                    return false;
+                };
+                let acked = std::mem::take(&mut shared.acked);
+                shared.pending.retain(|event| !acked.contains(&event.message_id));
+                // 还没对上的 ack 留着：事件可能刚写出去、ack 先到。
+                shared.acked = acked;
+                if shared.pending.is_empty() {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(ACK_POLL);
+        }
+    }
+
+    fn send_line(&self, line: &str) {
+        let Ok(mut shared) = self.shared.lock() else {
+            return;
+        };
+        let Some(stream) = shared.stream.as_ref() else {
+            return;
+        };
+        let Ok(mut write_half) = stream.try_clone() else {
+            shared.stream = None;
+            return;
+        };
+        if write_half.write_all(line.as_bytes()).is_err() {
+            shared.stream = None;
+            return;
+        }
+        let _ = write_half.flush();
     }
 }
 
-/// 从一行 JSON 里取 ack 的 messageId。只认 kind=ack，避免把别的消息当回执。
-fn extract_ack_message_id(line: &str) -> Option<String> {
-    if !line.contains("\"kind\":\"ack\"") {
-        return None;
+/// 处理一行入站消息。ack 记账，control 分派。
+fn handle_inbound(shared: &Arc<Mutex<Shared>>, line: &str) {
+    if line.contains("\"kind\":\"ack\"") {
+        if let Some(id) = field(line, "messageId") {
+            if let Ok(mut guard) = shared.lock() {
+                guard.acked.insert(id);
+            }
+        }
+        return;
     }
-    let key = "\"messageId\":\"";
-    let start = line.find(key)? + key.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    if !line.contains("\"kind\":\"control\"") {
+        return;
+    }
+    let request_id = field(line, "requestId");
+    let command = field(line, "command").unwrap_or_default();
+
+    let (ok, text) = match command.as_str() {
+        "interrupt" => {
+            let signal = shared.lock().ok().and_then(|guard| guard.turn_signal.clone());
+            match signal {
+                Some(signal) => {
+                    signal.abort();
+                    (true, "已请求中断：当前这轮读完即停".to_string())
+                }
+                // 没有正在跑的轮次时不算失败——IM 那端点「中断」时任务可能刚好结束了。
+                None => (true, "当前没有正在进行的任务".to_string()),
+            }
+        }
+        other => (
+            false,
+            format!("claw 尚未支持控制命令：{other}"),
+        ),
+    };
+
+    let Some(request_id) = request_id else {
+        return;
+    };
+    let (token, stream) = {
+        let Ok(guard) = shared.lock() else {
+            return;
+        };
+        (
+            guard.endpoint.token.clone(),
+            guard.stream.as_ref().and_then(|s| s.try_clone().ok()),
+        )
+    };
+    let Some(mut stream) = stream else {
+        return;
+    };
+    let reply = format!(
+        "{{\"token\":\"{}\",\"kind\":\"control_result\",\"requestId\":\"{}\",\"ok\":{},\"text\":\"{}\"}}\n",
+        escape_json(&token),
+        escape_json(&request_id),
+        if ok { "true" } else { "false" },
+        escape_json(&text)
+    );
+    let _ = stream.write_all(reply.as_bytes());
+    let _ = stream.flush();
 }
 
 /// 进程级单例。一个 claw 进程只对应一个宿主会话，所以用全局而不是把
@@ -267,6 +431,16 @@ pub fn install(raw: &str) {
 pub fn emit(kind: &str, text: &str) {
     if let Some(Some(bridge)) = BRIDGE.get() {
         bridge.emit(kind, text);
+    }
+}
+
+/// 注册/清空当前轮次的中断信号。中断命令从读线程来，信号是 Arc<AtomicBool>，
+/// 跨线程共享是安全的。
+pub fn set_turn_signal(signal: Option<runtime::HookAbortSignal>) {
+    if let Some(Some(bridge)) = BRIDGE.get() {
+        if let Ok(mut shared) = bridge.shared.lock() {
+            shared.turn_signal = signal;
+        }
     }
 }
 
@@ -297,11 +471,53 @@ mod tests {
     }
 
     #[test]
-    fn reads_ack_message_id_only_from_ack_frames() {
-        let ack = "{\"token\":\"t\",\"kind\":\"ack\",\"messageId\":\"claw-1-2\"}";
-        assert_eq!(extract_ack_message_id(ack).as_deref(), Some("claw-1-2"));
-        // 控制命令也带 messageId 形状的字段，不能被当成回执。
-        let control = "{\"token\":\"t\",\"kind\":\"control\",\"messageId\":\"claw-1-2\"}";
-        assert!(extract_ack_message_id(control).is_none());
+    fn reads_fields_and_unescapes_them() {
+        let line = "{\"token\":\"t\",\"kind\":\"ack\",\"messageId\":\"claw-1-2\"}";
+        assert_eq!(field(line, "messageId").as_deref(), Some("claw-1-2"));
+        // 转义序列要还原，否则带引号或换行的字段会被截断。
+        let escaped = "{\"command\":\"a\\\"b\",\"requestId\":\"r1\"}";
+        assert_eq!(field(escaped, "command").as_deref(), Some("a\"b"));
+        assert_eq!(field(escaped, "requestId").as_deref(), Some("r1"));
+        assert!(field(line, "missing").is_none());
+    }
+
+    #[test]
+    fn interrupt_aborts_the_registered_turn_signal() {
+        let signal = runtime::HookAbortSignal::new();
+        let shared = Arc::new(Mutex::new(Shared {
+            endpoint: BridgeEndpoint {
+                addr: "127.0.0.1:1".to_string(),
+                token: "t".to_string(),
+            },
+            stream: None,
+            pending: VecDeque::new(),
+            acked: HashSet::new(),
+            turn_signal: Some(signal.clone()),
+        }));
+        assert!(!signal.is_aborted());
+        handle_inbound(
+            &shared,
+            "{\"token\":\"t\",\"kind\":\"control\",\"requestId\":\"r1\",\"command\":\"interrupt\"}",
+        );
+        assert!(signal.is_aborted(), "interrupt 必须真的把信号置位");
+    }
+
+    #[test]
+    fn ack_frames_do_not_reach_the_control_path() {
+        // 控制命令也带 messageId 形状的字段；把 ack 当控制命令会误触发中断。
+        let signal = runtime::HookAbortSignal::new();
+        let shared = Arc::new(Mutex::new(Shared {
+            endpoint: BridgeEndpoint {
+                addr: "127.0.0.1:1".to_string(),
+                token: "t".to_string(),
+            },
+            stream: None,
+            pending: VecDeque::new(),
+            acked: HashSet::new(),
+            turn_signal: Some(signal.clone()),
+        }));
+        handle_inbound(&shared, "{\"token\":\"t\",\"kind\":\"ack\",\"messageId\":\"m1\"}");
+        assert!(!signal.is_aborted());
+        assert!(shared.lock().unwrap().acked.contains("m1"));
     }
 }
