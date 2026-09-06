@@ -16,6 +16,8 @@
 )]
 mod init;
 mod input;
+// Multi-AI Code 定制：把结构化事件推给宿主 Electron 应用。
+mod multi_ai_code_im_bridge;
 mod render;
 mod setup_wizard;
 
@@ -1527,6 +1529,21 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--version" | "-V" => {
                 wants_version = true;
+                index += 1;
+            }
+            // Multi-AI Code 定制：宿主用它把结构化事件回传通道交给我们。
+            // 值形如 tcp://127.0.0.1:<port>?token=<token>。解析失败不报错——
+            // 桥是可选能力，claw 必须能脱离宿主独立运行。
+            "--multi-ai-code-im-ipc" => {
+                if let Some(value) = args.get(index + 1) {
+                    multi_ai_code_im_bridge::install(value);
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            flag if flag.starts_with("--multi-ai-code-im-ipc=") => {
+                multi_ai_code_im_bridge::install(&flag["--multi-ai-code-im-ipc=".len()..]);
                 index += 1;
             }
             "--model" => {
@@ -7749,6 +7766,9 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Multi-AI Code 定制：一轮开始/结束/失败各推一条结构化事件给宿主。
+        // 三处调用都是 fire-and-forget，桥没装或宿主不在时是空操作。
+        multi_ai_code_im_bridge::emit("task_started", input);
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -7769,6 +7789,9 @@ impl LiveCli {
                     &mut stdout,
                 )?;
                 let final_text = final_assistant_text(&summary);
+                // 先推给宿主再打印：后面的自动压缩提示和 persist_session 都可能提前返回，
+                // 放在末尾会让回传在那些路径上静默丢失。
+                multi_ai_code_im_bridge::emit("assistant_final", &final_text);
                 if !final_text.is_empty() {
                     println!("{final_text}");
                 }
@@ -7958,6 +7981,10 @@ impl LiveCli {
                                 }
 
                                 // Not a context window error, or out of rounds
+                                multi_ai_code_im_bridge::emit(
+                                    "turn_error",
+                                    &retry_error.to_string(),
+                                );
                                 return Err(Box::new(retry_error));
                             }
                         }
@@ -7965,6 +7992,7 @@ impl LiveCli {
                 }
 
                 // If not a context window error, return original error
+                multi_ai_code_im_bridge::emit("turn_error", &error.to_string());
                 Err(Box::new(error))
             }
         }
