@@ -5302,6 +5302,7 @@ async fn stream_with_provider(
     let mut events = Vec::new();
     let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
     let mut pending_thinking: BTreeMap<u32, (String, Option<String>)> = BTreeMap::new();
+    let mut pending_passthrough: BTreeMap<u32, (serde_json::Value, String)> = BTreeMap::new();
     let mut saw_stop = false;
 
     while let Some(event) = stream.next_event().await? {
@@ -5314,6 +5315,7 @@ async fn stream_with_provider(
                         &mut events,
                         &mut pending_tools,
                         &mut pending_thinking,
+                        &mut pending_passthrough,
                         true,
                     );
                 }
@@ -5325,6 +5327,7 @@ async fn stream_with_provider(
                     &mut events,
                     &mut pending_tools,
                     &mut pending_thinking,
+                    &mut pending_passthrough,
                     true,
                 );
             }
@@ -5336,6 +5339,8 @@ async fn stream_with_provider(
                 }
                 ContentBlockDelta::InputJsonDelta { partial_json } => {
                     if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
+                        input.push_str(&partial_json);
+                    } else if let Some((_, input)) = pending_passthrough.get_mut(&delta.index) {
                         input.push_str(&partial_json);
                     }
                 }
@@ -5362,8 +5367,31 @@ async fn stream_with_provider(
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                     events.push(AssistantEvent::ToolUse { id, name, input });
                 }
+                if let Some((mut raw, input)) = pending_passthrough.remove(&stop.index) {
+                    if !input.is_empty() {
+                        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&input) else {
+                            return Err(ApiError::IncompleteResponse(format!(
+                                "a {} block ended with unparsable input_json_delta data",
+                                raw.get("type")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("server"),
+                            )));
+                        };
+                        if let Some(object) = raw.as_object_mut() {
+                            object.insert("input".to_string(), parsed);
+                        }
+                    }
+                    events.push(AssistantEvent::Passthrough(raw.to_string()));
+                }
             }
             ApiStreamEvent::MessageDelta(delta) => {
+                // A paused turn is not a finished answer; this path cannot resume it.
+                if delta.delta.stop_reason.as_deref() == Some("pause_turn") {
+                    return Err(ApiError::IncompleteResponse(
+                        "the model paused this turn (stop_reason=pause_turn) and this build                          cannot resume it"
+                            .to_string(),
+                    ));
+                }
                 events.push(AssistantEvent::Usage(delta.usage.token_usage()));
             }
             ApiStreamEvent::MessageStop(_) => {
@@ -5397,6 +5425,12 @@ async fn stream_with_provider(
             ..message_request.clone()
         })
         .await?;
+    if response.stop_reason.as_deref() == Some("pause_turn") {
+        return Err(ApiError::IncompleteResponse(
+            "the model paused this turn (stop_reason=pause_turn) and this build cannot resume it"
+                .to_string(),
+        ));
+    }
     let mut events = response_to_events(response);
     push_prompt_cache_record(client, &mut events);
     Ok(events)
@@ -5486,6 +5520,16 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     },
+                    // Replayed as the server sent it. An unparsable body becomes an
+                    // empty text block and is dropped by the filter below, rather
+                    // than going out as an invented shape the server never sent.
+                    ContentBlock::Passthrough { json } => serde_json::from_str(json)
+                        .map_or_else(
+                            |_| InputContentBlock::Text {
+                                text: String::new(),
+                            },
+                            InputContentBlock::Passthrough,
+                        ),
                 })
                 .filter(
                     |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
@@ -5505,6 +5549,7 @@ fn push_output_block(
     events: &mut Vec<AssistantEvent>,
     pending_tools: &mut BTreeMap<u32, (String, String, String)>,
     pending_thinking: &mut BTreeMap<u32, (String, Option<String>)>,
+    pending_passthrough: &mut BTreeMap<u32, (serde_json::Value, String)>,
     streaming_tool_input: bool,
 ) {
     match block {
@@ -5537,6 +5582,17 @@ fn push_output_block(
                 });
             }
         }
+        // Carried through as data, never dispatched as a tool: the server already
+        // ran it, but the next request must replay it for `pause_turn` to resume.
+        // While streaming it is held open like a tool call so `input_json_delta`
+        // chunks can be merged before the event is emitted.
+        OutputContentBlock::Unknown(raw) => {
+            if streaming_tool_input {
+                pending_passthrough.insert(block_index, (raw, String::new()));
+            } else {
+                events.push(AssistantEvent::Passthrough(raw.to_string()));
+            }
+        }
         OutputContentBlock::RedactedThinking { .. } => {}
     }
 }
@@ -5545,6 +5601,8 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
     let mut events = Vec::new();
     let mut pending_tools = BTreeMap::new();
     let mut pending_thinking = BTreeMap::new();
+    // Non-streaming blocks arrive whole, so nothing accumulates here.
+    let mut pending_passthrough = BTreeMap::new();
 
     for (index, block) in response.content.into_iter().enumerate() {
         let index = u32::try_from(index).expect("response block index overflow");
@@ -5554,6 +5612,7 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
             &mut events,
             &mut pending_tools,
             &mut pending_thinking,
+            &mut pending_passthrough,
             false,
         );
         if let Some((id, name, input)) = pending_tools.remove(&index) {
@@ -6919,12 +6978,12 @@ mod tests {
     };
     use serde_json::json;
 
-    fn env_lock() -> &'static Mutex<()> {
+    pub(crate) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -8158,6 +8217,7 @@ mod tests {
         let mut events = Vec::new();
         let mut pending_tools = BTreeMap::new();
         let mut pending_thinking = BTreeMap::new();
+        let mut pending_passthrough = BTreeMap::new();
 
         push_output_block(
             OutputContentBlock::ToolUse {
@@ -8169,6 +8229,7 @@ mod tests {
             &mut events,
             &mut pending_tools,
             &mut pending_thinking,
+            &mut pending_passthrough,
             true,
         );
         push_output_block(
@@ -8181,6 +8242,7 @@ mod tests {
             &mut events,
             &mut pending_tools,
             &mut pending_thinking,
+            &mut pending_passthrough,
             true,
         );
 
@@ -11030,5 +11092,138 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+}
+
+/// Covers the subagent stream path (`stream_with_provider`) against a local mock.
+///
+/// This is a separate production entry point from the main CLI's `consume_stream`:
+/// it has its own block accumulation and its own stop-reason handling, so a fix
+/// verified on the CLI says nothing about this one.
+#[cfg(test)]
+mod server_tool_passthrough_tests {
+    use super::{stream_with_provider, AssistantEvent};
+    use api::{InputMessage, MessageRequest, ProviderClient};
+    use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
+
+    /// Restores each variable to the value it had before the test, including on
+    /// the panic path, so a dead mock address is never left behind for whichever
+    /// test runs next.
+    struct EnvRestore {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvRestore {
+        fn set(pairs: &[(&'static str, String)]) -> Self {
+            let saved = pairs
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var(key).ok();
+                    std::env::set_var(key, value);
+                    (*key, previous)
+                })
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, previous) in &self.saved {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn request_for(scenario: &str) -> MessageRequest {
+        MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![InputMessage::user_text(format!(
+                "{SCENARIO_PREFIX}{scenario}"
+            ))],
+            stream: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_stream_keeps_server_blocks_and_their_streamed_input() {
+        // Shared with the rest of this crate's env-mutating tests, so they cannot
+        // interleave and clobber each other's variables.
+        let _guard = crate::tests::env_guard();
+        let mock = MockAnthropicService::spawn().await.expect("mock service");
+        let _env = EnvRestore::set(&[
+            ("ANTHROPIC_API_KEY", "sk-test-passthrough".to_string()),
+            ("ANTHROPIC_BASE_URL", mock.base_url()),
+        ]);
+
+        let client = ProviderClient::from_model("claude-sonnet-4-6").expect("client");
+        let events = stream_with_provider(&client, &request_for("server_tool_passthrough"))
+            .await
+            .expect("a server tool block must not fail the stream");
+
+        let passthroughs: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantEvent::Passthrough(json) => Some(json),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            passthroughs.len(),
+            2,
+            "the server tool block and its result must both survive: {events:?}"
+        );
+
+        let server_use: serde_json::Value =
+            serde_json::from_str(passthroughs[0]).expect("passthrough should be JSON");
+        assert_eq!(server_use["type"], "server_tool_use");
+        assert_eq!(
+            server_use["input"]["url"], "https://example.com",
+            "streamed input must be merged in, not the empty object from block start"
+        );
+        let result: serde_json::Value =
+            serde_json::from_str(passthroughs[1]).expect("passthrough should be JSON");
+        assert_eq!(result["type"], "web_search_tool_result");
+
+        // The client tool must be dispatched normally, with its own arguments.
+        let tool_uses: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantEvent::ToolUse { name, input, .. } => {
+                    Some((name.as_str(), input.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_uses.len(), 1, "only the client tool may be dispatched");
+        assert_eq!(tool_uses[0].0, "read_file");
+        assert_eq!(tool_uses[0].1, r#"{"path":"fixture.txt"}"#);
+    }
+
+    #[tokio::test]
+    async fn subagent_stream_refuses_to_finish_a_paused_turn() {
+        // Shared with the rest of this crate's env-mutating tests, so they cannot
+        // interleave and clobber each other's variables.
+        let _guard = crate::tests::env_guard();
+        let mock = MockAnthropicService::spawn().await.expect("mock service");
+        let _env = EnvRestore::set(&[
+            ("ANTHROPIC_API_KEY", "sk-test-passthrough".to_string()),
+            ("ANTHROPIC_BASE_URL", mock.base_url()),
+        ]);
+
+        let client = ProviderClient::from_model("claude-sonnet-4-6").expect("client");
+        let error = stream_with_provider(&client, &request_for("paused_turn"))
+            .await
+            .expect_err("a paused turn must not be reported as a finished answer");
+
+        assert!(
+            error.to_string().contains("pause_turn"),
+            "the failure must say the turn was paused: {error}"
+        );
     }
 }

@@ -70,6 +70,11 @@ pub enum ApiError {
         last_error: Box<ApiError>,
     },
     InvalidSseFrame(&'static str),
+    /// The response arrived intact but does not represent a finished turn - the
+    /// server paused mid-turn, or a block's streamed input never completed.
+    /// Distinct from a transport failure: retrying the same request is not the
+    /// remedy, so this is never retryable.
+    IncompleteResponse(String),
     BackoffOverflow {
         attempt: u32,
         base_delay: Duration,
@@ -156,6 +161,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::IncompleteResponse(_)
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. } => false,
         }
@@ -175,6 +181,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::IncompleteResponse(_)
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. } => None,
         }
@@ -197,6 +204,7 @@ impl ApiError {
             Self::Api { status, .. } if status.as_u16() == 429 => "provider_rate_limit",
             Self::Api { .. } if self.is_generic_fatal_wrapper() => "provider_internal",
             Self::Api { .. } => "provider_error",
+            Self::IncompleteResponse(_) => "incomplete_response",
             Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
                 "provider_transport"
             }
@@ -224,6 +232,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::IncompleteResponse(_)
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. } => false,
         }
@@ -254,6 +263,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::IncompleteResponse(_)
             | Self::BackoffOverflow { .. }
             | Self::RequestBodySizeExceeded { .. } => false,
         }
@@ -383,6 +393,7 @@ impl Display for ApiError {
                 last_error,
             } => write!(f, "api failed after {attempts} attempts: {last_error}"),
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
+            Self::IncompleteResponse(message) => write!(f, "incomplete response: {message}"),
             Self::BackoffOverflow {
                 attempt,
                 base_delay,

@@ -49,6 +49,13 @@ pub enum ContentBlock {
         output: String,
         is_error: bool,
     },
+    /// A block this build does not model, stored as its original JSON text.
+    ///
+    /// Held as a string rather than a parsed value so [`ContentBlock`] stays
+    /// `Eq`. It is replayed on the next request and never dispatched as a tool.
+    Passthrough {
+        json: String,
+    },
 }
 
 /// One conversation message with optional token-usage metadata.
@@ -870,6 +877,21 @@ impl ContentBlock {
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
             }
+            // Written back as the original object so a reloaded session replays
+            // exactly what the server sent. A body that will not parse is stored
+            // under its own marker type rather than dropped, keeping the loss
+            // visible instead of silently shrinking the history.
+            Self::Passthrough { json } => {
+                return JsonValue::parse(json).unwrap_or_else(|_| {
+                    let mut broken = BTreeMap::new();
+                    broken.insert(
+                        "type".to_string(),
+                        JsonValue::String("claw_unparsable_passthrough".to_string()),
+                    );
+                    broken.insert("raw".to_string(), JsonValue::String(json.clone()));
+                    JsonValue::Object(broken)
+                });
+            }
         }
         JsonValue::Object(object)
     }
@@ -906,6 +928,19 @@ impl ContentBlock {
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| SessionError::Format("missing is_error".to_string()))?,
+            }),
+            // Recorded by an earlier run as an unparsable passthrough; carry the
+            // original text forward rather than failing the whole session load.
+            "claw_unparsable_passthrough" => Ok(Self::Passthrough {
+                json: required_string(object, "raw")?,
+            }),
+            // Any other type is a block this build does not model - a server-side
+            // block from a newer API, most often. Loading it back as a passthrough
+            // is what lets a resumed session replay it; rejecting it here would
+            // make every session containing one unloadable. Known types above are
+            // still validated strictly, so a malformed `tool_use` remains an error.
+            _ if object.contains_key("type") => Ok(Self::Passthrough {
+                json: value.render(),
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"
@@ -1130,6 +1165,22 @@ fn persisted_block_json(block: &ContentBlock) -> JsonValue {
                 JsonValue::String(sanitize_jsonl_field(output)),
             );
             object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
+        }
+        // Persisted as the original object so a resumed session replays what the
+        // server sent, with the unparsable case marked rather than dropped.
+        ContentBlock::Passthrough { json } => {
+            return JsonValue::parse(json).unwrap_or_else(|_| {
+                let mut broken = BTreeMap::new();
+                broken.insert(
+                    "type".to_string(),
+                    JsonValue::String("claw_unparsable_passthrough".to_string()),
+                );
+                broken.insert(
+                    "raw".to_string(),
+                    JsonValue::String(sanitize_jsonl_field(json)),
+                );
+                JsonValue::Object(broken)
+            });
         }
     }
     JsonValue::Object(object)
@@ -1775,6 +1826,36 @@ mod tests {
         fs::remove_file(path).expect("temp file should be removable");
     }
 
+    /// A saved session containing a server-side block must load again. Before
+    /// this, `from_json` rejected any unmodeled type, so a session that had
+    /// merely *seen* a `server_tool_use` block became unloadable - resume and
+    /// `--continue` would fail outright.
+    #[test]
+    fn passthrough_blocks_round_trip_through_session_json() {
+        let original = ContentBlock::Passthrough {
+            json: r#"{"type":"server_tool_use","id":"srvtoolu_web","name":"webReader","input":{"url":"https://example.com"}}"#
+                .to_string(),
+        };
+
+        let encoded = original.to_json();
+        assert_eq!(
+            encoded
+                .as_object()
+                .and_then(|object| object.get("type"))
+                .and_then(JsonValue::as_str),
+            Some("server_tool_use"),
+            "the original block, not a wrapper, must be written"
+        );
+
+        let ContentBlock::Passthrough { json } =
+            ContentBlock::from_json(&encoded).expect("a saved session must load again")
+        else {
+            panic!("an unmodeled block must load back as a passthrough");
+        };
+        let reparsed = JsonValue::parse(&json).expect("round-tripped block should be JSON");
+        assert_eq!(reparsed, encoded, "fields must survive the round trip");
+    }
+
     #[test]
     fn rejects_legacy_session_json_without_messages() {
         // given
@@ -1805,8 +1886,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_content_block_type() {
-        // given
+    /// An unknown *type* is no longer an error: it is a block this build does not
+    /// model - typically a server-side block from a newer API - and it is kept so
+    /// a resumed session can replay it. What must still fail is a block that is
+    /// structurally broken rather than merely unfamiliar.
+    fn preserves_unknown_content_block_types_but_rejects_broken_ones() {
+        // given a block with an unfamiliar but well-formed type
         let block = JsonValue::Object(
             [("type".to_string(), JsonValue::String("unknown".to_string()))]
                 .into_iter()
@@ -1814,11 +1899,49 @@ mod tests {
         );
 
         // when
-        let error = ContentBlock::from_json(&block)
-            .expect_err("content blocks should reject unknown types");
+        let parsed = ContentBlock::from_json(&block)
+            .expect("an unfamiliar block type must be preserved, not rejected");
 
-        // then
-        assert!(error.to_string().contains("unsupported block type"));
+        // then it round-trips rather than being dropped
+        assert_eq!(
+            parsed,
+            ContentBlock::Passthrough {
+                json: block.render(),
+            }
+        );
+
+        // and a block with no type at all is still malformed
+        let missing_type = JsonValue::Object(
+            [("text".to_string(), JsonValue::String("hi".to_string()))]
+                .into_iter()
+                .collect(),
+        );
+        let error = ContentBlock::from_json(&missing_type)
+            .expect_err("a block without a type must be rejected");
+        assert!(error.to_string().contains("missing block type"));
+
+        // as is a non-string type
+        let numeric_type = JsonValue::Object(
+            [("type".to_string(), JsonValue::Number(7))]
+                .into_iter()
+                .collect(),
+        );
+        let error = ContentBlock::from_json(&numeric_type)
+            .expect_err("a non-string type must be rejected");
+        assert!(error.to_string().contains("missing block type"));
+
+        // and a known type missing a required field is still an error
+        let broken_tool_use = JsonValue::Object(
+            [
+                ("type".to_string(), JsonValue::String("tool_use".to_string())),
+                ("id".to_string(), JsonValue::String("tool-1".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let error = ContentBlock::from_json(&broken_tool_use)
+            .expect_err("a malformed known block must be rejected");
+        assert!(error.to_string().contains("name"));
     }
 
     #[test]

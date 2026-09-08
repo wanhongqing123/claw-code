@@ -1107,6 +1107,111 @@ enum BlockKind {
         name: String,
         json: String,
     },
+    /// A block we do not model, held verbatim so it can be replayed.
+    /// `json` accumulates `input_json_delta` chunks the same way a tool call does.
+    Passthrough {
+        raw: serde_json::Value,
+        json: String,
+    },
+}
+
+/// Register a block that just started, so its deltas can be routed by index.
+///
+/// Thinking blocks intentionally register nothing: with no entry, their deltas
+/// and their stop are skipped.
+fn start_stream_block(
+    index: u32,
+    block: OutputContentBlock,
+    block_kind: &mut BTreeMap<u32, BlockKind>,
+    text_buf: &mut BTreeMap<u32, String>,
+) {
+    match block {
+        OutputContentBlock::Text { text } => {
+            block_kind.insert(index, BlockKind::Text);
+            text_buf.insert(index, text);
+        }
+        OutputContentBlock::ToolUse { id, name, input } => {
+            let json = if input.as_object().is_some_and(|m| m.is_empty()) {
+                String::new()
+            } else {
+                input.to_string()
+            };
+            block_kind.insert(index, BlockKind::Tool { id, name, json });
+        }
+        // Registered so the reassembled message still carries it, in order:
+        // a paused turn is resumed by replaying this content unchanged.
+        OutputContentBlock::Unknown(raw) => {
+            block_kind.insert(
+                index,
+                BlockKind::Passthrough {
+                    raw,
+                    json: String::new(),
+                },
+            );
+        }
+        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
+    }
+}
+
+/// Append an `input_json_delta` chunk to whichever block owns this index.
+///
+/// An unregistered index is skipped rather than guessed at, so a block we do not
+/// track can never leak its partial JSON into a neighbouring tool call.
+fn append_stream_input_json(
+    index: u32,
+    partial_json: &str,
+    block_kind: &mut BTreeMap<u32, BlockKind>,
+) {
+    if let Some(BlockKind::Tool { json, .. } | BlockKind::Passthrough { json, .. }) =
+        block_kind.get_mut(&index)
+    {
+        json.push_str(partial_json);
+    }
+}
+
+/// Seal a finished block into `finished`, keyed by index so order is preserved.
+fn finish_stream_block(
+    index: u32,
+    block_kind: &mut BTreeMap<u32, BlockKind>,
+    text_buf: &mut BTreeMap<u32, String>,
+    finished: &mut BTreeMap<u32, OutputContentBlock>,
+) -> Result<(), String> {
+    match block_kind.remove(&index) {
+        Some(BlockKind::Text) => {
+            let text = text_buf.remove(&index).unwrap_or_default();
+            if !text.is_empty() {
+                finished.insert(index, OutputContentBlock::Text { text });
+            }
+        }
+        Some(BlockKind::Tool { id, name, json }) => {
+            let input =
+                serde_json::from_str::<Value>(&json).unwrap_or_else(|_| json!({ "raw": json }));
+            finished.insert(index, OutputContentBlock::ToolUse { id, name, input });
+        }
+        Some(BlockKind::Passthrough { mut raw, json }) => {
+            // The start event carries an empty `input`; the real value arrives as
+            // input_json_delta chunks, exactly as for a tool call. Merge it back so
+            // the replayed block carries what the server actually sent.
+            if !json.is_empty() {
+                let Ok(input) = serde_json::from_str::<Value>(&json) else {
+                    // Falling back to the start event's empty `input` would look
+                    // complete while dropping the real arguments, so report the
+                    // truncation instead of replaying a block the server never sent.
+                    return Err(format!(
+                        "block {index} ({}) ended with unparsable input_json_delta data, so this \
+                         response is incomplete",
+                        raw.get("type").and_then(Value::as_str).unwrap_or("unknown"),
+                    ));
+                };
+                if let Some(object) = raw.as_object_mut() {
+                    object.insert("input".to_string(), input);
+                }
+            }
+            finished.insert(index, OutputContentBlock::Unknown(raw));
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 const KNOWN_RAG_BOOTSTRAP_PHASES: &[&str] =
@@ -1345,6 +1450,20 @@ pub async fn run(
             content: output_to_input_blocks(&response.content),
         });
 
+        // `pause_turn` means the server stopped mid-turn and expects the request
+        // to be reissued with this content replayed. We do not drive that
+        // continuation yet, so say the turn is unfinished rather than letting it
+        // read as a normal completion — a truncated answer that looks successful
+        // is worse than one that admits it stopped early.
+        if response.stop_reason.as_deref() == Some("pause_turn") {
+            persist_conversation_sessions(&config, &ws_str, model.as_str(), &messages)?;
+            return Err(
+                "the model paused this turn (stop_reason=pause_turn) and this build \
+                 cannot resume it; the answer above is incomplete"
+                    .into(),
+            );
+        }
+
         let tool_uses = collect_tool_uses(&response.content);
         if tool_uses.is_empty() || response.stop_reason.as_deref() != Some("tool_use") {
             persist_conversation_sessions(&config, &ws_str, model.as_str(), &messages)?;
@@ -1469,22 +1588,7 @@ async fn stream_to_message_response(
             StreamEvent::ContentBlockStart(ContentBlockStartEvent {
                 index,
                 content_block,
-            }) => match content_block {
-                OutputContentBlock::Text { text } => {
-                    block_kind.insert(index, BlockKind::Text);
-                    text_buf.insert(index, text);
-                }
-                OutputContentBlock::ToolUse { id, name, input } => {
-                    let json = if input.as_object().is_some_and(|m| m.is_empty()) {
-                        String::new()
-                    } else {
-                        input.to_string()
-                    };
-                    block_kind.insert(index, BlockKind::Tool { id, name, json });
-                }
-                OutputContentBlock::Thinking { .. }
-                | OutputContentBlock::RedactedThinking { .. } => {}
-            },
+            }) => start_stream_block(index, content_block, &mut block_kind, &mut text_buf),
             StreamEvent::ContentBlockDelta(delta) => match delta.delta {
                 ContentBlockDelta::TextDelta { text } => {
                     if !text.is_empty() {
@@ -1504,29 +1608,16 @@ async fn stream_to_message_response(
                     }
                 }
                 ContentBlockDelta::InputJsonDelta { partial_json } => {
-                    if let Some(BlockKind::Tool { json, .. }) = block_kind.get_mut(&delta.index) {
-                        json.push_str(&partial_json);
-                    }
+                    append_stream_input_json(delta.index, &partial_json, &mut block_kind);
                 }
                 ContentBlockDelta::ThinkingDelta { .. }
                 | ContentBlockDelta::SignatureDelta { .. } => {}
             },
             StreamEvent::ContentBlockStop(stop) => {
-                let idx = stop.index;
-                match block_kind.remove(&idx) {
-                    Some(BlockKind::Text) => {
-                        let t = text_buf.remove(&idx).unwrap_or_default();
-                        if !t.is_empty() {
-                            finished.insert(idx, OutputContentBlock::Text { text: t });
-                        }
-                    }
-                    Some(BlockKind::Tool { id, name, json }) => {
-                        let input = serde_json::from_str::<Value>(&json)
-                            .unwrap_or_else(|_| json!({ "raw": json }));
-                        finished.insert(idx, OutputContentBlock::ToolUse { id, name, input });
-                    }
-                    None => {}
-                }
+                // Truncated block input makes the response incomplete; surfacing it
+                // is the whole point of the check, so this must not be discarded.
+                finish_stream_block(stop.index, &mut block_kind, &mut text_buf, &mut finished)
+                    .map_err(ApiError::IncompleteResponse)?;
             }
             StreamEvent::MessageDelta(MessageDeltaEvent { delta, usage: u }) => {
                 usage = u;
@@ -1606,6 +1697,10 @@ fn output_to_input_blocks(blocks: &[OutputContentBlock]) -> Vec<InputContentBloc
                 name: name.clone(),
                 input: input.clone(),
             }),
+            // Replayed byte-for-byte. There is nothing for the client to execute,
+            // but resuming a `pause_turn` requires the server to see its own
+            // content again, so dropping these would silently break that turn.
+            OutputContentBlock::Unknown(raw) => Some(InputContentBlock::Passthrough(raw.clone())),
             OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {
                 None
             }
@@ -2311,6 +2406,172 @@ mod tests {
         assert!(validate_rel_path("..\\x").is_err());
         assert!(validate_rel_path("a/../../b").is_err());
         assert!(validate_rel_path("src/main.rs").is_ok());
+    }
+
+    /// Drives one realistic stream through the same functions the production
+    /// loop calls: text, a server-side tool block whose input arrives as
+    /// `input_json_delta`, its result block, and an ordinary client tool call.
+    ///
+    /// Asserts the text and client tool survive intact, the server blocks are
+    /// preserved verbatim in position, and no block's partial JSON leaks into a
+    /// neighbouring index.
+    #[test]
+    fn streamed_server_tool_blocks_survive_aggregation_without_crossing_indexes() {
+        let mut block_kind = BTreeMap::new();
+        let mut text_buf = BTreeMap::new();
+        let mut finished = BTreeMap::new();
+
+        let server_use = serde_json::json!({
+            "type": "server_tool_use",
+            "id": "call_1",
+            "name": "webReader",
+            "input": {}
+        });
+        let server_result = serde_json::json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "call_1",
+            "content": [{ "type": "web_search_result", "title": "Example" }]
+        });
+
+        start_stream_block(
+            0,
+            OutputContentBlock::Text {
+                text: "looking it up".to_string(),
+            },
+            &mut block_kind,
+            &mut text_buf,
+        );
+        finish_stream_block(0, &mut block_kind, &mut text_buf, &mut finished)
+            .expect("text block should seal");
+
+        start_stream_block(
+            1,
+            OutputContentBlock::Unknown(server_use),
+            &mut block_kind,
+            &mut text_buf,
+        );
+        start_stream_block(
+            3,
+            OutputContentBlock::ToolUse {
+                id: "toolu_9".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({}),
+            },
+            &mut block_kind,
+            &mut text_buf,
+        );
+        // Interleaved deltas for two open blocks - the failure mode this guards
+        // against is one block's chunks landing in the other's buffer.
+        append_stream_input_json(1, r#"{"url":"#, &mut block_kind);
+        append_stream_input_json(3, r#"{"path":"#, &mut block_kind);
+        append_stream_input_json(1, r#""https://example.com"}"#, &mut block_kind);
+        append_stream_input_json(3, r#""a.rs"}"#, &mut block_kind);
+        finish_stream_block(1, &mut block_kind, &mut text_buf, &mut finished)
+            .expect("server block should seal");
+
+        start_stream_block(
+            2,
+            OutputContentBlock::Unknown(server_result.clone()),
+            &mut block_kind,
+            &mut text_buf,
+        );
+        finish_stream_block(2, &mut block_kind, &mut text_buf, &mut finished)
+            .expect("result block should seal");
+        finish_stream_block(3, &mut block_kind, &mut text_buf, &mut finished)
+            .expect("client tool block should seal");
+
+        let content: Vec<OutputContentBlock> = finished.into_values().collect();
+        assert_eq!(content.len(), 4, "every block must survive: {content:?}");
+
+        match &content[0] {
+            OutputContentBlock::Text { text } => assert_eq!(text, "looking it up"),
+            other => panic!("expected text first, got {other:?}"),
+        }
+        match &content[1] {
+            OutputContentBlock::Unknown(raw) => {
+                assert_eq!(raw["type"], "server_tool_use");
+                assert_eq!(
+                    raw["input"],
+                    serde_json::json!({ "url": "https://example.com" }),
+                    "streamed input must be merged back into the preserved block"
+                );
+            }
+            other => panic!("expected the server tool block, got {other:?}"),
+        }
+        assert_eq!(
+            content[2],
+            OutputContentBlock::Unknown(server_result),
+            "a result block with no deltas must stay byte-for-byte"
+        );
+        match &content[3] {
+            OutputContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_9");
+                assert_eq!(name, "read_file");
+                assert_eq!(
+                    input,
+                    &serde_json::json!({ "path": "a.rs" }),
+                    "the client tool's input must not absorb the server block's chunks"
+                );
+            }
+            other => panic!("expected the client tool call, got {other:?}"),
+        }
+
+        // The next request must carry the server blocks back unchanged.
+        let replay = output_to_input_blocks(&content);
+        assert_eq!(
+            replay.len(),
+            4,
+            "text + two server blocks + the client tool call: {replay:?}"
+        );
+        assert!(matches!(replay[0], InputContentBlock::Text { .. }));
+        assert!(matches!(replay[3], InputContentBlock::ToolUse { .. }));
+        let (InputContentBlock::Passthrough(first), InputContentBlock::Passthrough(second)) =
+            (&replay[1], &replay[2])
+        else {
+            panic!("both server blocks must replay as passthroughs: {replay:?}");
+        };
+        assert_eq!(first["type"], "server_tool_use");
+        assert_eq!(
+            first["input"],
+            serde_json::json!({ "url": "https://example.com" })
+        );
+        assert_eq!(second["type"], "web_search_tool_result");
+    }
+
+    /// A block whose streamed input never completed must be reported, not sealed
+    /// with the empty `input` from its start event - that would look like a whole,
+    /// successful block while the real arguments were silently dropped.
+    #[test]
+    fn a_truncated_server_block_is_reported_rather_than_sealed_empty() {
+        let mut block_kind = BTreeMap::new();
+        let mut text_buf = BTreeMap::new();
+        let mut finished = BTreeMap::new();
+
+        start_stream_block(
+            0,
+            OutputContentBlock::Unknown(serde_json::json!({
+                "type": "server_tool_use",
+                "id": "call_1",
+                "name": "webReader",
+                "input": {}
+            })),
+            &mut block_kind,
+            &mut text_buf,
+        );
+        // The stream ends mid-object.
+        append_stream_input_json(0, r#"{"url":"htt"#, &mut block_kind);
+
+        let error = finish_stream_block(0, &mut block_kind, &mut text_buf, &mut finished)
+            .expect_err("a truncated block must not seal successfully");
+
+        assert!(
+            error.contains("server_tool_use") && error.contains("incomplete"),
+            "the failure should name the block and say the response is incomplete: {error}"
+        );
+        assert!(
+            finished.is_empty(),
+            "no block may be recorded from truncated input: {finished:?}"
+        );
     }
 
     #[test]

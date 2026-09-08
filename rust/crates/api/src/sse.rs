@@ -266,6 +266,51 @@ mod tests {
         );
     }
 
+    /// Regression: a server-side tool block used to fail the **whole request**
+    /// with `unknown variant `server_tool_use``, because the content-block enum
+    /// had no catch-all. Reproduced against GLM-5.3 over the Anthropic-compatible
+    /// endpoint, but the same shape comes from Anthropic's own server tools.
+    #[test]
+    fn parses_unmodeled_server_tool_block_instead_of_failing() {
+        let frame = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"call_d8176ee91daa43eebfdcea41\",\"name\":\"webReader\",\"input\":{\"return_format\":\"text\",\"url\":\"file:///E:/x/README.md\"}}}\n\n"
+        );
+
+        let event = parse_frame(frame).expect("server tool block must not fail the response");
+        let Some(StreamEvent::ContentBlockStart(start)) = event else {
+            panic!("expected a content_block_start, got {event:?}");
+        };
+        assert_eq!(start.index, 2, "the block index must be preserved");
+        let OutputContentBlock::Unknown(raw) = start.content_block else {
+            panic!("expected the block to be preserved verbatim");
+        };
+        assert_eq!(raw["type"], "server_tool_use");
+        assert_eq!(raw["name"], "webReader");
+        assert_eq!(raw["id"], "call_d8176ee91daa43eebfdcea41");
+    }
+
+    /// The catch-all must not swallow block types we do model - otherwise a
+    /// renamed field would silently degrade tool calls into no-ops.
+    #[test]
+    fn known_blocks_still_win_over_the_catch_all() {
+        let frame = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{}}}\n\n"
+        );
+
+        let event = parse_frame(frame).expect("frame should parse");
+        assert!(matches!(
+            event,
+            Some(StreamEvent::ContentBlockStart(
+                crate::types::ContentBlockStartEvent {
+                    content_block: OutputContentBlock::ToolUse { .. },
+                    ..
+                }
+            ))
+        ));
+    }
+
     #[test]
     fn parses_thinking_related_deltas() {
         let thinking = concat!(

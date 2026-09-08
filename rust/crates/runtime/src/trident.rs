@@ -253,6 +253,8 @@ fn extract_file_operation(block: &ContentBlock) -> Option<(String, FileOp)> {
         }
         ContentBlock::Text { .. } => None,
         ContentBlock::Thinking { .. } => None,
+        // Server-side work: never a local file operation.
+        ContentBlock::Passthrough { .. } => None,
     }
 }
 
@@ -359,6 +361,7 @@ fn is_chatty_message(msg: &ConversationMessage) -> bool {
             ContentBlock::ToolUse { input, .. } => input.len(),
             ContentBlock::ToolResult { output, .. } => output.len(),
             ContentBlock::Thinking { thinking, .. } => thinking.len(),
+            ContentBlock::Passthrough { json } => json.len(),
         })
         .sum();
 
@@ -551,6 +554,9 @@ fn fingerprint_message(index: usize, msg: &ConversationMessage) -> Option<Messag
             ContentBlock::Thinking { thinking, .. } => {
                 text_length += thinking.len();
             }
+            ContentBlock::Passthrough { json } => {
+                text_length += json.len();
+            }
         }
     }
 
@@ -624,6 +630,7 @@ fn generate_cluster_summary(messages: &[&ConversationMessage]) -> String {
                 }
                 ContentBlock::Text { .. } => {}
                 ContentBlock::Thinking { .. } => {}
+                ContentBlock::Passthrough { .. } => {}
             }
         }
     }
@@ -660,6 +667,8 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
                 tool_name, output, ..
             } => (tool_name.len() + output.len()) / 4 + 1,
             ContentBlock::Thinking { thinking, .. } => thinking.len() / 4 + 1,
+            // Replayed verbatim, so it costs its full size next request.
+            ContentBlock::Passthrough { json } => json.len() / 4 + 1,
         })
         .sum()
 }

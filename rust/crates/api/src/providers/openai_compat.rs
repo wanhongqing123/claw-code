@@ -1281,7 +1281,9 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                             "arguments": input.to_string(),
                         }
                     })),
-                    InputContentBlock::ToolResult { .. } => {}
+                    // An Anthropic-shaped passthrough block has no OpenAI
+                    // equivalent, so it cannot be carried across this bridge.
+                    InputContentBlock::ToolResult { .. } | InputContentBlock::Passthrough(_) => {}
                 }
             }
             let needs_reasoning = model_requires_reasoning_content_in_history(model);
@@ -1332,7 +1334,9 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     }
                     Some(msg)
                 }
-                InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::Thinking { .. }
+                | InputContentBlock::ToolUse { .. }
+                | InputContentBlock::Passthrough(_) => None,
             })
             .collect(),
     }

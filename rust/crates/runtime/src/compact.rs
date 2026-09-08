@@ -220,7 +220,10 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-            ContentBlock::Text { .. } | ContentBlock::Thinking { .. } => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Thinking { .. }
+            // Server-side work, not a client tool the summary should list.
+            | ContentBlock::Passthrough { .. } => None,
         })
         .collect::<Vec<_>>();
     tool_names.sort_unstable();
@@ -331,6 +334,18 @@ fn summarize_block(block: &ContentBlock) -> String {
             format!("thinking ({} chars)", thinking.chars().count())
         }
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
+        ContentBlock::Passthrough { json } => {
+            let kind = serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{kind} ({} chars)", json.chars().count())
+        }
         ContentBlock::ToolResult {
             tool_name,
             output,
@@ -392,6 +407,7 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
             ContentBlock::ToolUse { input, .. } => input.as_str(),
             ContentBlock::ToolResult { output, .. } => output.as_str(),
             ContentBlock::Thinking { thinking, .. } => thinking.as_str(),
+            ContentBlock::Passthrough { json } => json.as_str(),
         })
         .flat_map(extract_file_candidates)
         .collect::<Vec<_>>();
@@ -415,6 +431,7 @@ fn first_text_block(message: &ConversationMessage) -> Option<&str> {
         ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. }
         | ContentBlock::Thinking { .. }
+        | ContentBlock::Passthrough { .. }
         | ContentBlock::Text { .. } => None,
     })
 }
@@ -461,6 +478,8 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => text.len() / 4 + 1,
+            // Replayed verbatim, so it costs its full size on the next request.
+            ContentBlock::Passthrough { json } => json.len() / 4 + 1,
             ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
             ContentBlock::ToolResult {
                 tool_name, output, ..

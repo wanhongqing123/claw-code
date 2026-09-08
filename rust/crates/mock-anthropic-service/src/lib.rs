@@ -100,6 +100,8 @@ enum Scenario {
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
+    ServerToolPassthrough,
+    PausedTurn,
 }
 
 impl Scenario {
@@ -117,6 +119,8 @@ impl Scenario {
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
+            "server_tool_passthrough" => Some(Self::ServerToolPassthrough),
+            "paused_turn" => Some(Self::PausedTurn),
             _ => None,
         }
     }
@@ -135,6 +139,8 @@ impl Scenario {
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
+            Self::ServerToolPassthrough => "server_tool_passthrough",
+            Self::PausedTurn => "paused_turn",
         }
     }
 }
@@ -464,6 +470,13 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
+        // Round one mixes an unmodeled server-side block in with ordinary
+        // content; round two proves the client replayed it.
+        Scenario::ServerToolPassthrough => match latest_tool_result(request) {
+            Some(_) => final_text_sse("server tool passthrough complete."),
+            None => server_tool_passthrough_sse(),
+        },
+        Scenario::PausedTurn => paused_turn_sse(),
     }
 }
 
@@ -634,6 +647,13 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             1_000,
             500,
         ),
+        // These two are exercised over the streaming path; the non-streaming
+        // fallback only needs to be a well-formed terminal response.
+        Scenario::ServerToolPassthrough => text_message_response(
+            "msg_server_tool_passthrough",
+            "server tool passthrough complete.",
+        ),
+        Scenario::PausedTurn => text_message_response("msg_paused_turn", "partial answer so far"),
     }
 }
 
@@ -651,6 +671,8 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
+        Scenario::ServerToolPassthrough => "req_server_tool_passthrough",
+        Scenario::PausedTurn => "req_paused_turn",
     }
 }
 
@@ -907,6 +929,201 @@ fn tool_uses_sse(tool_uses: &[ToolUseSse<'_>]) -> String {
             "type": "message_delta",
             "delta": {"stop_reason": "tool_use", "stop_sequence": null},
             "usage": usage_json(12, 4)
+        }),
+    );
+    append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));
+    body
+}
+
+/// One turn carrying, in order: text, a server-side tool block whose input
+/// arrives as `input_json_delta`, that tool's result block, and a real client
+/// tool call. Blocks open and close one at a time, as the API emits them; the
+/// client tool's own chunks arriving after the server block's are what would
+/// expose a buffer shared across blocks.
+fn server_tool_passthrough_sse() -> String {
+    let mut body = String::new();
+    append_sse(
+        &mut body,
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_server_tool_passthrough",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": DEFAULT_MODEL,
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": usage_json(12, 0)
+            }
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "checking the page"}
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": 0}),
+    );
+    append_sse(
+        &mut body,
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "srvtoolu_web",
+                "name": "webReader",
+                "input": {}
+            }
+        }),
+    );
+    for chunk in [r#"{"url":"#, r#""https://example.com"}"#] {
+        append_sse(
+            &mut body,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": chunk}
+            }),
+        );
+    }
+    append_sse(
+        &mut body,
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": 1}),
+    );
+    append_sse(
+        &mut body,
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_web",
+                "content": [{"type": "web_search_result", "title": "Example Domain"}]
+            }
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": 2}),
+    );
+    append_sse(
+        &mut body,
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 3,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_read_fixture",
+                "name": "read_file",
+                "input": {}
+            }
+        }),
+    );
+    for chunk in [r#"{"path":"#, r#""fixture.txt"}"#] {
+        append_sse(
+            &mut body,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 3,
+                "delta": {"type": "input_json_delta", "partial_json": chunk}
+            }),
+        );
+    }
+    append_sse(
+        &mut body,
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": 3}),
+    );
+    append_sse(
+        &mut body,
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+            "usage": usage_json(12, 4)
+        }),
+    );
+    append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));
+    body
+}
+
+/// A turn the server stopped mid-flight. The client cannot resume it, so it must
+/// report the turn as unfinished rather than present the partial text as an answer.
+fn paused_turn_sse() -> String {
+    let mut body = String::new();
+    append_sse(
+        &mut body,
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_paused_turn",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": DEFAULT_MODEL,
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": usage_json(9, 0)
+            }
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "partial answer so far"}
+        }),
+    );
+    append_sse(
+        &mut body,
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": 0}),
+    );
+    append_sse(
+        &mut body,
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "pause_turn", "stop_sequence": null},
+            "usage": usage_json(9, 3)
         }),
     );
     append_sse(&mut body, "message_stop", json!({"type": "message_stop"}));

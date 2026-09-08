@@ -11638,6 +11638,9 @@ fn render_export_text(session: &Session) -> String {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
                 ContentBlock::Thinking { .. } => {}
+                ContentBlock::Passthrough { json } => {
+                    lines.push(format!("[server block] {json}"));
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -11876,6 +11879,10 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                     }
                 }
                 ContentBlock::Thinking { .. } => {}
+                ContentBlock::Passthrough { json } => {
+                    lines.push(format!("**Server block** `{json}`"));
+                    lines.push(String::new());
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!(
                         "**Tool call** `{name}` _(id `{}`)_",
@@ -12762,8 +12769,10 @@ impl AnthropicRuntimeClient {
         let mut pending_tool: Option<(String, String, String)> = None;
         // 累积 reasoning_content 到 Thinking 块（修复 DeepSeek V4 reasoning_content 协议 bug）
         let mut pending_thinking: Option<(String, Option<String>)> = None;
+        let mut pending_passthrough: Option<(serde_json::Value, String)> = None;
         let mut block_has_thinking_summary = false;
         let mut saw_stop = false;
+        let mut paused_mid_turn = false;
         let mut received_any_event = false;
 
         loop {
@@ -12797,6 +12806,7 @@ impl AnthropicRuntimeClient {
                             out,
                             &mut events,
                             &mut pending_tool,
+                            &mut pending_passthrough,
                             true,
                             &mut block_has_thinking_summary,
                         )?;
@@ -12816,6 +12826,7 @@ impl AnthropicRuntimeClient {
                         out,
                         &mut events,
                         &mut pending_tool,
+                        &mut pending_passthrough,
                         true,
                         &mut block_has_thinking_summary,
                     )?;
@@ -12836,6 +12847,8 @@ impl AnthropicRuntimeClient {
                     }
                     ContentBlockDelta::InputJsonDelta { partial_json } => {
                         if let Some((_, _, input)) = &mut pending_tool {
+                            input.push_str(&partial_json);
+                        } else if let Some((_, input)) = &mut pending_passthrough {
                             input.push_str(&partial_json);
                         }
                     }
@@ -12870,6 +12883,25 @@ impl AnthropicRuntimeClient {
                             signature,
                         });
                     }
+                    if let Some((mut raw, input)) = pending_passthrough.take() {
+                        if !input.is_empty() {
+                            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&input)
+                            else {
+                                // Replaying the start event's empty `input` would look
+                                // complete while dropping the real arguments.
+                                return Err(RuntimeError::new(format!(
+                                    "a {} block ended with unparsable input_json_delta data, \n                                     so this response is incomplete",
+                                    raw.get("type")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("server"),
+                                )));
+                            };
+                            if let Some(object) = raw.as_object_mut() {
+                                object.insert("input".to_string(), parsed);
+                            }
+                        }
+                        events.push(AssistantEvent::Passthrough(raw.to_string()));
+                    }
                     if let Some((id, name, input)) = pending_tool.take() {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
@@ -12882,6 +12914,13 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
+                    // `pause_turn` means the server stopped mid-turn and expects the
+                    // request to be reissued with this content replayed. Driving that
+                    // continuation is not implemented, so record it and fail below
+                    // rather than let a half-finished turn read as a normal answer.
+                    if delta.delta.stop_reason.as_deref() == Some("pause_turn") {
+                        paused_mid_turn = true;
+                    }
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
                 }
                 ApiStreamEvent::MessageStop(_) => {
@@ -12905,6 +12944,13 @@ impl AnthropicRuntimeClient {
             })
         {
             events.push(AssistantEvent::MessageStop);
+        }
+
+        if paused_mid_turn {
+            return Err(RuntimeError::new(
+                "the model paused this turn (stop_reason=pause_turn) and this build cannot \
+                 resume it; the answer above is incomplete",
+            ));
         }
 
         if events
@@ -13814,6 +13860,7 @@ fn push_output_block(
     out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
+    pending_passthrough: &mut Option<(serde_json::Value, String)>,
     streaming_tool_input: bool,
     block_has_thinking_summary: &mut bool,
 ) -> Result<(), RuntimeError> {
@@ -13856,6 +13903,17 @@ fn push_output_block(
             render_thinking_block_summary(out, None, true)?;
             *block_has_thinking_summary = true;
         }
+        // Not rendered and not dispatched as a tool — the server already ran it.
+        // Held open like a tool call so `input_json_delta` chunks can be merged
+        // before the block is recorded; emitting it here would replay the empty
+        // `input` from the start event.
+        OutputContentBlock::Unknown(raw) => {
+            if streaming_tool_input {
+                *pending_passthrough = Some((raw, String::new()));
+            } else {
+                events.push(AssistantEvent::Passthrough(raw.to_string()));
+            }
+        }
     }
     Ok(())
 }
@@ -13866,6 +13924,7 @@ fn response_to_events(
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
+    let mut pending_passthrough = None;
 
     for block in response.content {
         let mut block_has_thinking_summary = false;
@@ -13874,6 +13933,7 @@ fn response_to_events(
             out,
             &mut events,
             &mut pending_tool,
+            &mut pending_passthrough,
             false,
             &mut block_has_thinking_summary,
         )?;
@@ -14088,6 +14148,12 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
                     }),
+                    // Replayed as the server sent it. If it somehow will not parse
+                    // it is dropped rather than sent as a wrapper object, since an
+                    // invented shape is likelier to be rejected than an absent block.
+                    ContentBlock::Passthrough { json } => serde_json::from_str(json)
+                        .ok()
+                        .map(InputContentBlock::Passthrough),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
@@ -19033,6 +19099,7 @@ UU conflicted.rs",
         let mut out = Vec::new();
         let mut events = Vec::new();
         let mut pending_tool = None;
+        let mut pending_passthrough = None;
         let mut block_has_thinking_summary = false;
 
         push_output_block(
@@ -19042,6 +19109,7 @@ UU conflicted.rs",
             &mut out,
             &mut events,
             &mut pending_tool,
+            &mut pending_passthrough,
             false,
             &mut block_has_thinking_summary,
         )
@@ -19057,6 +19125,7 @@ UU conflicted.rs",
         let mut out = Vec::new();
         let mut events = Vec::new();
         let mut pending_tool = None;
+        let mut pending_passthrough = None;
         let mut block_has_thinking_summary = false;
 
         push_output_block(
@@ -19068,6 +19137,7 @@ UU conflicted.rs",
             &mut out,
             &mut events,
             &mut pending_tool,
+            &mut pending_passthrough,
             true,
             &mut block_has_thinking_summary,
         )

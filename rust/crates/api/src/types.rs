@@ -107,6 +107,14 @@ pub enum InputContentBlock {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+    /// An assistant block replayed exactly as the server sent it.
+    ///
+    /// Server-side tool blocks have no client-side counterpart to rebuild, but
+    /// they still belong in the history: resuming a `pause_turn` requires the
+    /// prior content to come back unchanged. Serialized untagged so the original
+    /// object goes out as-is rather than nested under another `type`.
+    #[serde(untagged)]
+    Passthrough(Value),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -157,9 +165,46 @@ impl MessageResponse {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutputContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: Value,
+    },
+    /// A block type this build does not model, kept **verbatim**.
+    ///
+    /// The Anthropic wire format is open: server-side tools add block types
+    /// (`server_tool_use`, `web_search_tool_result`, `mcp_tool_use`, ...) and
+    /// compatible providers add their own. Without this arm serde rejects the
+    /// **whole response** over one unrecognized block, so a single server-tool
+    /// call fails the entire request.
+    ///
+    /// The original JSON is retained rather than discarded because "the client
+    /// need not execute it" is not the same as "the client need not send it
+    /// back": a `pause_turn` response has to be replayed with its content intact
+    /// for the server to resume the turn.
+    Unknown(Value),
+}
+
+/// The block shapes this build understands.
+///
+/// Split out so [`OutputContentBlock`] can keep an escape hatch for everything
+/// else while these still deserialize strictly - a known block that is missing a
+/// field is an error, never silently demoted to [`OutputContentBlock::Unknown`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum OutputContentBlock {
+enum KnownOutputContentBlock {
     Text {
         text: String,
     },
@@ -177,6 +222,87 @@ pub enum OutputContentBlock {
     RedactedThinking {
         data: Value,
     },
+}
+
+impl OutputContentBlock {
+    /// The wire `type` of this block, whether or not it is modeled.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        match self {
+            Self::Text { .. } => "text",
+            Self::ToolUse { .. } => "tool_use",
+            Self::Thinking { .. } => "thinking",
+            Self::RedactedThinking { .. } => "redacted_thinking",
+            Self::Unknown(raw) => raw.get("type").and_then(Value::as_str).unwrap_or_default(),
+        }
+    }
+
+    fn into_known(self) -> Result<KnownOutputContentBlock, Value> {
+        match self {
+            Self::Text { text } => Ok(KnownOutputContentBlock::Text { text }),
+            Self::ToolUse { id, name, input } => {
+                Ok(KnownOutputContentBlock::ToolUse { id, name, input })
+            }
+            Self::Thinking {
+                thinking,
+                signature,
+            } => Ok(KnownOutputContentBlock::Thinking {
+                thinking,
+                signature,
+            }),
+            Self::RedactedThinking { data } => {
+                Ok(KnownOutputContentBlock::RedactedThinking { data })
+            }
+            Self::Unknown(raw) => Err(raw),
+        }
+    }
+}
+
+impl From<KnownOutputContentBlock> for OutputContentBlock {
+    fn from(value: KnownOutputContentBlock) -> Self {
+        match value {
+            KnownOutputContentBlock::Text { text } => Self::Text { text },
+            KnownOutputContentBlock::ToolUse { id, name, input } => {
+                Self::ToolUse { id, name, input }
+            }
+            KnownOutputContentBlock::Thinking {
+                thinking,
+                signature,
+            } => Self::Thinking {
+                thinking,
+                signature,
+            },
+            KnownOutputContentBlock::RedactedThinking { data } => Self::RedactedThinking { data },
+        }
+    }
+}
+
+impl Serialize for OutputContentBlock {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.clone().into_known() {
+            Ok(known) => known.serialize(serializer),
+            Err(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OutputContentBlock {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let raw = Value::deserialize(deserializer)?;
+        let kind = raw
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| D::Error::custom("content block is missing a string `type`"))?;
+        if matches!(kind, "text" | "tool_use" | "thinking" | "redacted_thinking") {
+            // Deserialize strictly: a malformed known block must still fail.
+            return serde_json::from_value::<KnownOutputContentBlock>(raw)
+                .map(Into::into)
+                .map_err(D::Error::custom);
+        }
+        Ok(Self::Unknown(raw))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,7 +411,98 @@ mod tests {
     use runtime::format_usd;
     use serde_json::json;
 
-    use super::{InputContentBlock, MessageResponse, Usage};
+    use super::{InputContentBlock, MessageResponse, OutputContentBlock, Usage};
+
+    /// A non-streaming response carrying a server-side block alongside ordinary
+    /// ones must parse, keep every block in order, and keep the unknown one
+    /// byte-for-byte so it can be replayed.
+    #[test]
+    fn non_streaming_response_preserves_an_unmodeled_server_block() {
+        let body = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "anthropic/glm-5.3",
+            "content": [
+                { "type": "text", "text": "checking" },
+                {
+                    "type": "server_tool_use",
+                    "id": "call_d8176ee9",
+                    "name": "webReader",
+                    "input": { "return_format": "text", "url": "https://example.com" }
+                },
+                { "type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a"} }
+            ],
+            "stop_reason": "tool_use"
+        });
+
+        let response: MessageResponse =
+            serde_json::from_value(body.clone()).expect("server tool block must not fail parsing");
+
+        assert_eq!(response.content.len(), 3, "no block may be dropped");
+        assert!(matches!(
+            response.content[0],
+            OutputContentBlock::Text { .. }
+        ));
+        assert!(matches!(
+            response.content[2],
+            OutputContentBlock::ToolUse { .. }
+        ));
+        let OutputContentBlock::Unknown(raw) = &response.content[1] else {
+            panic!(
+                "the server block must be preserved: {:?}",
+                response.content[1]
+            );
+        };
+        assert_eq!(raw, &body["content"][1], "preserved verbatim");
+        assert_eq!(response.content[1].kind(), "server_tool_use");
+
+        // And it round-trips: re-serializing yields the original object, which is
+        // what a `pause_turn` continuation has to send back.
+        assert_eq!(
+            serde_json::to_value(&response.content[1]).expect("serialize"),
+            body["content"][1]
+        );
+    }
+
+    /// The catch-all must not become a swallow-all: a *known* block missing a
+    /// required field is a real error, not an unknown block.
+    #[test]
+    fn a_malformed_known_block_still_fails_instead_of_becoming_unknown() {
+        let error = serde_json::from_value::<OutputContentBlock>(json!({
+            "type": "tool_use",
+            "id": "toolu_1"
+        }))
+        .expect_err("tool_use without name/input must be rejected");
+        assert!(
+            error.to_string().contains("name"),
+            "the error should name the missing field: {error}"
+        );
+    }
+
+    /// A block with no `type` at all is malformed, not "unknown".
+    #[test]
+    fn a_block_without_a_type_is_rejected() {
+        serde_json::from_value::<OutputContentBlock>(json!({ "text": "hi" }))
+            .expect_err("a block without `type` must be rejected");
+    }
+
+    /// Replaying history must put the original object back on the wire, not a
+    /// wrapper — the server has to see exactly what it sent.
+    #[test]
+    fn replayed_history_carries_the_original_server_block() {
+        let raw = json!({
+            "type": "server_tool_use",
+            "id": "call_1",
+            "name": "webReader",
+            "input": { "url": "https://example.com" }
+        });
+
+        let serialized = serde_json::to_value(InputContentBlock::Passthrough(raw.clone()))
+            .expect("serialize passthrough");
+
+        assert_eq!(serialized, raw, "replayed untouched, not re-wrapped");
+    }
 
     #[test]
     fn usage_total_tokens_includes_cache_tokens() {

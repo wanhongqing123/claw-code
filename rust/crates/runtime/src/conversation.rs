@@ -38,6 +38,11 @@ pub enum AssistantEvent {
         name: String,
         input: String,
     },
+    /// A response block this build does not model, carried as its original JSON.
+    ///
+    /// Not dispatched to any tool: it records work the server already performed.
+    /// It is kept so the next request can replay it, which `pause_turn` requires.
+    Passthrough(String),
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
     MessageStop,
@@ -764,6 +769,12 @@ fn build_assistant_message(
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
+            }
+            // Recorded in position so the replayed history matches what the
+            // server sent; it is not a tool call and dispatches nothing.
+            AssistantEvent::Passthrough(json) => {
+                flush_text_block(&mut text, &mut blocks);
+                blocks.push(ContentBlock::Passthrough { json });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
