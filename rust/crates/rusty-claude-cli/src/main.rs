@@ -3132,7 +3132,21 @@ fn config_model_for_current_dir() -> Option<String> {
 }
 
 fn resolve_repl_model(cli_model: String) -> Result<String, String> {
-    Ok(ModelProvenance::from_env_or_config_or_default(&cli_model)?.resolved)
+    let resolved = ModelProvenance::from_env_or_config_or_default(&cli_model)?.resolved;
+    export_model_for_subagent(&resolved);
+    Ok(resolved)
+}
+
+/// multi-ai-code fork：把最终生效的主模型登记给子代理。
+///
+/// 子代理（tools 里的 Agent 工具）拿不到命令行参数，`--model` 对它不可见，
+/// 于是上游给它写死了一个 Anthropic 模型名——用智谱 / DashScope / Ollama 时必失败。
+/// 写死那一条已拆掉，这里负责把主模型递过去。
+/// 不走环境变量：主模型可以被 `/model` 中途改掉，env 会留陈旧值，
+/// 而且会反过来被主模型自己的探测链读到、把 source 误报成 Env。
+/// 想让子代理用别的模型，设 `CLAW_SUBAGENT_MODEL`（来源链里优先于它）。
+fn export_model_for_subagent(model: &str) {
+    tools::set_current_main_model(model);
 }
 
 fn print_model_validation_warning_status(
@@ -8399,6 +8413,8 @@ impl LiveCli {
         };
 
         let model = resolve_model_alias_with_config(&model);
+        // 主模型换了，子代理要跟着换。
+        export_model_for_subagent(&model);
 
         if model == self.model {
             println!(

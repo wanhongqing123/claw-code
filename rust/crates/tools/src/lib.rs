@@ -4084,7 +4084,11 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
+// multi-ai-code fork: 子代理不再写死任何模型。
+// 上游原本是 `const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";`，它只对
+// Anthropic 官方凭据有意义：用智谱 / DashScope / Ollama 跑 claw 时，一旦触发
+// 子代理，就会拿着用户的 Key 去请求一个对方根本没有的模型名。
+// 现在模型必须有明确来源；一个都没有就报错，不静默回退到某家服务商。
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
@@ -4109,7 +4113,7 @@ where
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
+    let model = resolve_agent_model(input.model.as_deref())?;
     let agent_name = input
         .name
         .as_deref()
@@ -4211,11 +4215,12 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
 fn build_agent_runtime(
     job: &AgentJob,
 ) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
-    let model = job
-        .manifest
-        .model
-        .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
+    // manifest 里的 model 在 execute_agent_with_spawn 里已经定下来了；这里只是兼底，
+    // 同样不允许静默回退到写死的模型名。
+    let model = match job.manifest.model.clone() {
+        Some(model) if !model.trim().is_empty() => model,
+        _ => resolve_agent_model(None)?,
+    };
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
@@ -4246,12 +4251,70 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
     Ok(prompt)
 }
 
-fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+/// 子代理模型的回退链：先看专用变量，再跟随主模型。
+/// `CLAW_SUBAGENT_MODEL` 让人用便宜模型跑子任务；剩下三个就是主模型自己读的
+/// 那组（见 rusty-claude-cli 的 env_model_for_runtime），顺序保持一致。
+/// 子代理专用模型：想用更便宜的模型跑子任务时设它，优先于一切。
+const AGENT_MODEL_OVERRIDE_ENV: &str = "CLAW_SUBAGENT_MODEL";
+
+/// 没设专用模型、也没登记主模型时的兵底（独立跑 claw 的场景）。
+/// 顺序跟 rusty-claude-cli 的 `env_model_for_runtime` 一致。
+const AGENT_MODEL_ENV_CHAIN: [&str; 3] =
+    ["CLAW_MODEL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL"];
+
+/// multi-ai-code fork：CLI 把**当前生效的**主模型登记在这里。
+///
+/// 不用环境变量转一手，是因为主模型可以被 `/model` 中途改掉；
+/// 写进 env 会留下一个陈旧值，而且会反过来被主模型自己的探测链读到，
+/// 把 source 误报成 Env。
+static CURRENT_MAIN_MODEL: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// 登记当前主模型；传空串等于注销。启动时和 `/model` 切换后各调一次。
+pub fn set_current_main_model(model: &str) {
+    let next = {
+        let trimmed = model.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    if let Ok(mut slot) = CURRENT_MAIN_MODEL.write() {
+        *slot = next;
+    }
+}
+
+fn current_main_model() -> Option<String> {
+    CURRENT_MAIN_MODEL.read().ok().and_then(|slot| slot.clone())
+}
+
+fn env_model(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 子代理模型的来源链：专用覆盖 → 当前主模型 → 环境变量兵底。
+fn agent_model_from_env() -> Option<String> {
+    env_model(AGENT_MODEL_OVERRIDE_ENV)
+        .or_else(current_main_model)
+        .or_else(|| AGENT_MODEL_ENV_CHAIN.into_iter().find_map(env_model))
+}
+
+fn resolve_agent_model(model: Option<&str>) -> Result<String, String> {
+    resolve_agent_model_with(model, agent_model_from_env)
+}
+
+/// 把取 env 这一步参数化，单测就不用去改进程环境变量（那会跟并行用例互干）。
+fn resolve_agent_model_with<F>(model: Option<&str>, from_env: F) -> Result<String, String>
+where
+    F: FnOnce() -> Option<String>,
+{
+    if let Some(explicit) = model.map(str::trim).filter(|model| !model.is_empty()) {
+        return Ok(explicit.to_string());
+    }
+    from_env().ok_or_else(|| {
+        String::from(
+            "no model available for the sub-agent: pass `model` in the tool input, or set CLAW_SUBAGENT_MODEL (or CLAW_MODEL / ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_MODEL)",
+        )
+    })
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
@@ -6843,9 +6906,10 @@ mod tests {
         classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
         extract_recovery_outcome, final_assistant_text, global_cron_registry,
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
+        persist_agent_terminal_state, push_output_block, resolve_agent_model,
+        resolve_agent_model_with, run_task_packet, set_current_main_model, AgentInput, AgentJob,
         GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        SubagentToolExecutor, AGENT_MODEL_ENV_CHAIN, AGENT_MODEL_OVERRIDE_ENV,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -8689,6 +8753,9 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-store");
         std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        // 子代理不再回退到写死的 Anthropic 模型，模型必须有明确来源。
+        // 真实运行时这一步由 CLI 启动时登记主模型完成。
+        set_current_main_model("openai/glm-5.3");
         let captured = Arc::new(Mutex::new(None::<AgentJob>));
         let captured_for_spawn = Arc::clone(&captured);
 
@@ -8709,6 +8776,9 @@ mod tests {
         )
         .expect("Agent should succeed");
         std::env::remove_var("CLAWD_AGENT_STORE");
+
+        // 没填 model 时子代理跟随主模型，而不是某家服务商的写死值。
+        assert_eq!(manifest.model.as_deref(), Some("openai/glm-5.3"));
 
         assert_eq!(manifest.name, "ship-audit");
         assert_eq!(manifest.subagent_type.as_deref(), Some("Explore"));
@@ -8761,6 +8831,7 @@ mod tests {
         .expect("Agent should normalize explicit names");
         let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
+        set_current_main_model("");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -8772,6 +8843,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-runner");
         std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        set_current_main_model("openai/glm-5.3");
 
         let completed = execute_agent_with_spawn(
             AgentInput {
@@ -9202,6 +9274,7 @@ mod tests {
         assert_eq!(spawn_error_manifest_json["derivedState"], "truly_idle");
 
         std::env::remove_var("CLAWD_AGENT_STORE");
+        set_current_main_model("");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -9351,6 +9424,75 @@ mod tests {
         assert!(verification.contains("bash"));
         assert!(verification.contains("power_shell"));
         assert!(!verification.contains("write_file"));
+    }
+
+    // 上游把子代理模型写死成 `claude-opus-4-6`。用智谱 / DashScope / Ollama 跑 claw 时，
+    // 一旦触发子代理，就会拿着用户的 Key 去请求一个对方根本没有的模型名。
+    // 这一组钉的就是「模型必须有明确来源，不静默回退到某家服务商」。
+    #[test]
+    fn agent_model_prefers_the_explicit_input() {
+        let resolved = resolve_agent_model_with(Some("openai/glm-5.3"), || {
+            Some(String::from("anthropic/should-not-win"))
+        })
+        .expect("explicit model should resolve");
+        assert_eq!(resolved, "openai/glm-5.3");
+    }
+
+    #[test]
+    fn agent_model_falls_back_to_the_main_model() {
+        let resolved = resolve_agent_model_with(None, || Some(String::from("openai/glm-5.3")))
+            .expect("env model should resolve");
+        assert_eq!(resolved, "openai/glm-5.3");
+
+        // 空白字符串等同没填，不能当成合法模型名透下去。
+        let blank = resolve_agent_model_with(Some("   "), || Some(String::from("openai/glm-5.3")))
+            .expect("blank model should fall back");
+        assert_eq!(blank, "openai/glm-5.3");
+    }
+
+    #[test]
+    fn agent_model_errors_instead_of_defaulting_to_a_vendor() {
+        let error = resolve_agent_model_with(None, || None)
+            .expect_err("no model anywhere should be an error, not a hardcoded default");
+        assert!(error.contains("CLAW_SUBAGENT_MODEL"));
+        // 回归防线：这条路径上不得再出现任何写死的服务商模型名。
+        assert!(!error.contains("claude-opus"));
+    }
+
+    #[test]
+    fn agent_model_env_fallback_follows_the_main_model_order() {
+        // 兵底链顺序必须跟 rusty-claude-cli 的 env_model_for_runtime 一致，
+        // 否则独立跑 claw 时主对话和子代理会跑到两家不同的服务商上。
+        assert_eq!(
+            AGENT_MODEL_ENV_CHAIN,
+            ["CLAW_MODEL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL"]
+        );
+        assert_eq!(AGENT_MODEL_OVERRIDE_ENV, "CLAW_SUBAGENT_MODEL");
+    }
+
+    // 主模型可以被 `/model` 中途改掉，所以子代理读的是登记值而不是启动时快照。
+    #[test]
+    fn agent_model_follows_the_registered_main_model() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_current_main_model("openai/glm-5.3");
+        assert_eq!(
+            resolve_agent_model(None).expect("registered main model should resolve"),
+            "openai/glm-5.3"
+        );
+
+        // 切换主模型后子代理跟着换。
+        set_current_main_model("qwen/qwen-max");
+        assert_eq!(
+            resolve_agent_model(None).expect("switched main model should resolve"),
+            "qwen/qwen-max"
+        );
+
+        // 注销后回到「无来源则报错」，不会静默用某家服务商。
+        set_current_main_model("");
+        let error = resolve_agent_model(None).expect_err("no source should error");
+        assert!(!error.contains("claude-opus"));
     }
 
     #[test]
